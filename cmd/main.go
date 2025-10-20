@@ -1,258 +1,371 @@
 package main
+
 // Mysql change broadcaster
 import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
-	// "flag"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"path/filepath"
-    "github.com/redis/go-redis/v9"
 
+	"github.com/redis/go-redis/v9"
 
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/joho/godotenv"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/joho/godotenv"
+)
+
+const (
+	defaultRedisAddr      = "127.0.0.1:6379"
+	defaultRedisStream    = "binlog:all"
+	defaultDBPort         = "3306"
+	defaultServerID       = uint32(100)
+	defaultReconnectDelay = 5 * time.Second
 )
 
 var publisher *Publisher
-
 
 type tableKey struct {
 	schema string
 	table  string
 }
 type schemaInfo struct {
-	Columns  []string          // ordered
-	ColIndex map[string]int    // name -> index
-	PKCols   []string          // primary key column names (ordered)
+	Columns  []string       // ordered
+	ColIndex map[string]int // name -> index
+	PKCols   []string       // primary key column names (ordered)
 }
 
-// Add these new types to help with event structuring
-type TransactionInfo struct {
-    GTID     string `json:"gtid,omitempty"`
-    Binlog   struct {
-        File string `json:"file"`
-        Pos  uint32 `json:"pos"`
-    } `json:"binlog"`
-    ServerID uint32 `json:"server_id"`
-    XID      uint64 `json:"xid,omitempty"`
-    Seq      int64  `json:"seq"`
-}
-
-// Updated RowEvent struct - remove TransactionInfo
 type RowEvent struct {
-    Op        string                 `json:"op"`
-    Timestamp string                 `json:"timestamp"`  // IST timestamp
-    DB        string                 `json:"db"`
-    Table     string                 `json:"table"`
-    RowKey    interface{}            `json:"row_key"`
-    After     map[string]interface{} `json:"after,omitempty"`
-    Before    map[string]interface{} `json:"before,omitempty"`
-    Changes   []ColumnChange         `json:"changes,omitempty"`
-    Tombstone bool                   `json:"tombstone,omitempty"`
-    Seq       int64                  `json:"seq,omitempty"`    // Add sequence number directly to RowEvent
+	Op        string                 `json:"op"`
+	Timestamp string                 `json:"timestamp"` // IST timestamp
+	DB        string                 `json:"db"`
+	Table     string                 `json:"table"`
+	RowKey    interface{}            `json:"row_key"`
+	After     map[string]interface{} `json:"after,omitempty"`
+	Before    map[string]interface{} `json:"before,omitempty"`
+	Changes   []ColumnChange         `json:"changes,omitempty"`
+	Tombstone bool                   `json:"tombstone,omitempty"`
 }
 
 type ColumnChange struct {
-    Column string      `json:"column"`
-    From   interface{} `json:"from"`
-    To     interface{} `json:"to"`
+	Column string      `json:"column"`
+	From   interface{} `json:"from"`
+	To     interface{} `json:"to"`
 }
 
 // Row identification strategy enum
 type RowIDStrategy int
 
 const (
-    PrimaryKey RowIDStrategy = iota
-    CompositeHash
+	PrimaryKey RowIDStrategy = iota
+	CompositeHash
 )
 
 // Row identifier structure
 type RowIdentifier struct {
-    Value    string
-    Strategy RowIDStrategy
-    Columns  []string
+	Value    string
+	Strategy RowIDStrategy
+	Columns  []string
 }
 
-// Change tracking structure
-type ChangeTracking struct {
-    TableName      string
-    HasPrimaryKey  bool
-    PrimaryKeys    []string
-    ChangeType     string
-    RowID          RowIdentifier
-    ChangedColumns []string
+type Config struct {
+	Addr           string
+	DBUser         string
+	DBPass         string
+	DBHost         string
+	DBPort         string
+	DBName         string
+	ServerID       uint32
+	RedisAddr      string
+	RedisPass      string
+	RedisDB        int
+	RedisStream    string
+	ReconnectDelay time.Duration
+	LogFile        string
 }
 
 // Redis Publisher structure
 type Publisher struct {
-    r   *redis.Client
-    ctx context.Context
+	r      *redis.Client
+	ctx    context.Context
+	stream string
+	logger *EventLogger
 }
 
-func NewPublisher(addr, pass string, db int) *Publisher {
-    return &Publisher{
-        r: redis.NewClient(&redis.Options{
-            Addr:     addr,
-            Password: pass,
-            DB:       db,
-        }),
-        ctx: context.Background(),
-    }
+func NewPublisher(addr, pass string, db int, stream string, logger *EventLogger) *Publisher {
+	return &Publisher{
+		r: redis.NewClient(&redis.Options{
+			Addr:     addr,
+			Password: pass,
+			DB:       db,
+		}),
+		ctx:    context.Background(),
+		stream: stream,
+		logger: logger,
+	}
+}
+
+type EventLogger struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+func NewEventLogger(path string) (*EventLogger, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &EventLogger{file: f}, nil
+}
+
+func (l *EventLogger) Log(eventID string, payload []byte) {
+	if l == nil || l.file == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	timestamp := time.Now().Format(time.RFC3339Nano)
+	fmt.Fprintf(l.file, "%s event_id=%s payload=%s\n", timestamp, eventID, payload)
+}
+
+func (l *EventLogger) Close() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.file.Close()
 }
 
 // PublishJSON publishes JSON bytes to Redis stream
 func (p *Publisher) PublishJSON(jsonBytes []byte, eventID string) error {
-    args := &redis.XAddArgs{
-        Stream: "binlog:all",
-        Values: map[string]any{
-            "payload":  string(jsonBytes),
-            "event_id": eventID,
-            "ts":       time.Now().Unix(),
-        },
-    }
-    _, err := p.r.XAdd(p.ctx, args).Result()
-    return err
+	args := &redis.XAddArgs{
+		Stream: p.stream,
+		Values: map[string]any{
+			"payload":  string(jsonBytes),
+			"event_id": eventID,
+			"ts":       time.Now().Unix(),
+		},
+	}
+	_, err := p.r.XAdd(p.ctx, args).Result()
+	if err != nil {
+		return err
+	}
+	if p.logger != nil {
+		p.logger.Log(eventID, jsonBytes)
+	}
+	return nil
 }
 
 func main() {
-		// Load .env file
-    err := godotenv.Load()
-    if err != nil {
-        log.Fatalf("Error loading .env file: %v", err)
-    }
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
 
-    // Read variables from .env
-    addr := os.Getenv("ADDR") // e.g. "localhost:3306"
-	user := os.Getenv("DB_USER")
-    pass := os.Getenv("DB_PASS")
-    host := os.Getenv("DB_HOST")
-    dbPort := os.Getenv("DB_PORT")
-    dbName := os.Getenv("DB_NAME")
-    serverID := os.Getenv("SERVER_ID")
-    useGTID := os.Getenv("USE_GTID")
+func run() error {
+	if err := godotenv.Load(); err != nil {
+		log.Printf("No .env file found: %v", err)
+	}
 
-    if user == "" {
-        log.Fatal("please provide DB_USER in .env")
-    }
-    if host == "" {
-        log.Fatal("please provide DB_HOST in .env")
-    }
-    if dbPort == "" {
-        dbPort = "3306"
-    }
-    if dbName == "" {
-        log.Fatal("please provide DB_NAME in .env")
-    }
-    if addr == "" {
-        addr = fmt.Sprintf("%s:%s", host, dbPort)
-    }
-    if serverID == "" {
-        serverID = "100"
-    }
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
 
-    // Parse serverID to uint32
-    var sid uint32
-    fmt.Sscanf(serverID, "%d", &sid)
+	var msgLogger *EventLogger
+	if cfg.LogFile != "" {
+		msgLogger, err = NewEventLogger(cfg.LogFile)
+		if err != nil {
+			return fmt.Errorf("init message logger: %w", err)
+		}
+		defer msgLogger.Close()
+	}
 
-    // Plain SQL connection (for SHOW MASTER STATUS & information_schema).
-    sqlDB, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", user, pass, host, dbPort, dbName))
-    if err != nil { log.Fatal(err) }
-    defer sqlDB.Close()
+	publisher = NewPublisher(cfg.RedisAddr, cfg.RedisPass, cfg.RedisDB, cfg.RedisStream, msgLogger)
 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-    // Handle Ctrl+C cleanly
-    go func() {
-        ch := make(chan os.Signal, 1)
-        signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-        <-ch
-        log.Println("signal received, shutting down...")
-        cancel()
-    }()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
-    // Build binlog syncer
-    host, port := splitHostPort(addr)
-    syncerCfg := replication.BinlogSyncerConfig{
-        ServerID:  sid,
-        Flavor:    "mysql",
-        Host:      host,
-        Port:      port,
-        User:      user,
-        Password:  pass,
-        UseDecimal: true,
-        ParseTime:  true,
-    }
-    syncer := replication.NewBinlogSyncer(syncerCfg)
-    defer syncer.Close()
+	go func() {
+		select {
+		case sig := <-sigCh:
+			log.Printf("signal %s received, shutting down...", sig)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
-    var streamer *replication.BinlogStreamer
+	for {
+		if err := streamChanges(ctx, cfg); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			log.Printf("replication error: %v; retrying in %s", err, cfg.ReconnectDelay)
+			select {
+			case <-time.After(cfg.ReconnectDelay):
+			case <-ctx.Done():
+				return nil
+			}
+			continue
+		}
+		return nil
+	}
+}
 
-    if strings.ToLower(useGTID) == "true" {
-        // Read current executed GTID set and start from it
-        gtidStr, err := readExecutedGTIDSet(ctx, sqlDB)
-        if err != nil {
-            log.Fatalf("read GTID set: %v", err)
-        }
-        gs, err := mysql.ParseGTIDSet("mysql", gtidStr)
-        if err != nil {
-            log.Fatalf("parse GTID set: %v", err)
-        }
-        log.Printf("Starting from GTID: %s\n", gs.String())
-        streamer, err = syncer.StartSyncGTID(gs)
-        if err != nil { log.Fatal(err) }
-    } else {
-        // Start from current master file/pos
-        file, pos, err := readMasterFilePos(ctx, sqlDB)
-        if err != nil { log.Fatalf("SHOW MASTER STATUS: %v", err) }
-        startPos := mysql.Position{Name: file, Pos: uint32(pos)}
-        log.Printf("Starting from position: %s:%d\n", startPos.Name, startPos.Pos)
-        streamer, err = syncer.StartSync(startPos)
-        if err != nil { log.Fatal(err) }
-    }
+func loadConfig() (*Config, error) {
+	cfg := &Config{
+		DBUser:      os.Getenv("DB_USER"),
+		DBPass:      os.Getenv("DB_PASS"),
+		DBHost:      os.Getenv("DB_HOST"),
+		DBPort:      os.Getenv("DB_PORT"),
+		DBName:      os.Getenv("DB_NAME"),
+		RedisAddr:   os.Getenv("REDIS_ADDR"),
+		RedisPass:   os.Getenv("REDIS_PASS"),
+		RedisStream: os.Getenv("REDIS_STREAM"),
+		LogFile:     os.Getenv("MESSAGE_LOG_FILE"),
+	}
 
+	if cfg.DBUser == "" {
+		return nil, fmt.Errorf("DB_USER is required")
+	}
+	if cfg.DBHost == "" {
+		return nil, fmt.Errorf("DB_HOST is required")
+	}
+	if cfg.DBName == "" {
+		return nil, fmt.Errorf("DB_NAME is required")
+	}
 
-	// Cache table mappings (TableID -> TableMapEvent) and schema (columns + PKs)
+	if cfg.DBPort == "" {
+		cfg.DBPort = defaultDBPort
+	}
+
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		addr = fmt.Sprintf("%s:%s", cfg.DBHost, cfg.DBPort)
+	}
+	cfg.Addr = addr
+
+	serverIDStr := os.Getenv("SERVER_ID")
+	if serverIDStr == "" {
+		cfg.ServerID = defaultServerID
+	} else {
+		id, err := strconv.ParseUint(serverIDStr, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SERVER_ID: %w", err)
+		}
+		cfg.ServerID = uint32(id)
+	}
+
+	redisDBStr := os.Getenv("REDIS_DB")
+	if redisDBStr != "" {
+		val, err := strconv.Atoi(redisDBStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid REDIS_DB: %w", err)
+		}
+		cfg.RedisDB = val
+	}
+
+	if cfg.RedisAddr == "" {
+		cfg.RedisAddr = defaultRedisAddr
+	}
+	if cfg.RedisStream == "" {
+		cfg.RedisStream = defaultRedisStream
+	}
+
+	delayStr := os.Getenv("RECONNECT_DELAY")
+	if delayStr == "" {
+		cfg.ReconnectDelay = defaultReconnectDelay
+	} else {
+		delay, err := time.ParseDuration(delayStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid RECONNECT_DELAY: %w", err)
+		}
+		cfg.ReconnectDelay = delay
+	}
+
+	return cfg, nil
+}
+
+func (c Config) DSN() string {
+	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", c.DBUser, c.DBPass, c.DBHost, c.DBPort, c.DBName)
+}
+
+func streamChanges(ctx context.Context, cfg *Config) error {
+	sqlDB, err := sql.Open("mysql", cfg.DSN())
+	if err != nil {
+		return fmt.Errorf("open mysql: %w", err)
+	}
+	defer sqlDB.Close()
+
+	if err := sqlDB.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping mysql: %w", err)
+	}
+
+	file, pos, err := readMasterFilePos(ctx, sqlDB)
+	if err != nil {
+		return fmt.Errorf("read master status: %w", err)
+	}
+
+	host, port := splitHostPort(cfg.Addr)
+	syncerCfg := replication.BinlogSyncerConfig{
+		ServerID:   cfg.ServerID,
+		Flavor:     "mysql",
+		Host:       host,
+		Port:       port,
+		User:       cfg.DBUser,
+		Password:   cfg.DBPass,
+		UseDecimal: true,
+		ParseTime:  true,
+	}
+
+	syncer := replication.NewBinlogSyncer(syncerCfg)
+	defer syncer.Close()
+
+	startPos := mysql.Position{Name: file, Pos: uint32(pos)}
+	streamer, err := syncer.StartSync(startPos)
+	if err != nil {
+		return fmt.Errorf("start binlog sync: %w", err)
+	}
+	log.Printf("Streaming from master tip: %s:%d (realtime)", startPos.Name, startPos.Pos)
+
 	var (
 		tableMap sync.Map // map[uint64]*replication.TableMapEvent
 		schemaMu sync.Mutex
 		schema   = make(map[tableKey]*schemaInfo)
 	)
 
-	// Add periodic cleanup of tableMap cache
-	cleanupTableMapCache(&tableMap)
-
-    publisher = NewPublisher("127.0.0.1:6379", "", 0)  // localhost Redis with no password
-
 	for {
 		ev, err := streamer.GetEvent(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return // graceful shutdown
+				return ctx.Err()
 			}
-			log.Fatalf("GetEvent error: %v", err)
+			return fmt.Errorf("get event: %w", err)
 		}
 
 		switch e := ev.Event.(type) {
 		case *replication.RotateEvent:
-			log.Printf("Rotate to %s:%d\n", string(e.NextLogName), e.Position)
+			log.Printf("Rotate to %s:%d", string(e.NextLogName), e.Position)
 
 		case *replication.TableMapEvent:
-			tableMap.Store(e.TableID, e) // cache table map event
+			tableMap.Store(e.TableID, e)
 
-			// Ensure schema cache for this (schema, table)
 			key := tableKey{schema: string(e.Schema), table: string(e.Table)}
 			schemaMu.Lock()
 			if _, ok := schema[key]; !ok {
@@ -266,7 +379,6 @@ func main() {
 			schemaMu.Unlock()
 
 		case *replication.RowsEvent:
-			// Find schema/table via last TableMap
 			v, ok := tableMap.Load(e.TableID)
 			if !ok {
 				log.Printf("warn: missing table map for table_id=%d", e.TableID)
@@ -301,23 +413,21 @@ func main() {
 			}
 
 		default:
-			// other events (XID/QUERY/GTID) can be handled if you need them
+			// ignore other event types
 		}
 	}
-
-    
 }
 
 // --- helpers ---
 
 // Helper function to convert UTC to IST
 func toIST(utcTime string) string {
-    t, err := time.Parse(time.RFC3339, utcTime)
-    if err != nil {
-        return utcTime
-    }
-    ist, _ := time.LoadLocation("Asia/Kolkata")
-    return t.In(ist).Format("2006-01-02 15:04:05")
+	t, err := time.Parse(time.RFC3339, utcTime)
+	if err != nil {
+		return utcTime
+	}
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	return t.In(ist).Format("2006-01-02 15:04:05")
 }
 
 func splitHostPort(addr string) (string, uint16) {
@@ -342,12 +452,6 @@ func readMasterFilePos(ctx context.Context, db *sql.DB) (file string, pos uint64
 	return file, pos, nil
 }
 
-func readExecutedGTIDSet(ctx context.Context, db *sql.DB) (string, error) {
-	var gtid string
-	err := db.QueryRowContext(ctx, "SELECT @@GLOBAL.gtid_executed").Scan(&gtid)
-	return gtid, err
-}
-
 func loadSchemaInfo(ctx context.Context, db *sql.DB, schema, table string) (*schemaInfo, error) {
 	cols := []string{}
 	rows, err := db.QueryContext(ctx, `
@@ -355,14 +459,20 @@ func loadSchemaInfo(ctx context.Context, db *sql.DB, schema, table string) (*sch
 		FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION`, schema, table)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	for rows.Next() {
 		var c string
-		if err := rows.Scan(&c); err != nil { return nil, err }
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
 		cols = append(cols, c)
 	}
-	if err := rows.Err(); err != nil { return nil, err }
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	pk := []string{}
 	rows2, err := db.QueryContext(ctx, `
@@ -387,201 +497,119 @@ func loadSchemaInfo(ctx context.Context, db *sql.DB, schema, table string) (*sch
 	return &schemaInfo{Columns: cols, ColIndex: idx, PKCols: pk}, nil
 }
 
-// Helper function to get next sequence number
-func getNextSeq(filename string) (int64, error) {
-    if _, err := os.Stat(filename); os.IsNotExist(err) {
-        return 1, nil
-    }
-
-    // Read file and count existing entries
-    data, err := os.ReadFile(filename)
-    if err != nil {
-        return 0, err
-    }
-    
-    count := int64(strings.Count(string(data), `"seq":`))
-    return count + 1, nil
-}
-
-// Add error handling for file operations
-func appendToJSONFile(event *RowEvent, filename string) error {
-    maxRetries := 3
-    retryInterval := time.Second * 2
-    
-    var err error
-    for i := 0; i < maxRetries; i++ {
-        err = tryAppendToFile(event, filename)
-        if err == nil {
-            return nil
-        }
-        
-        if os.IsNotExist(err) {
-            if err = os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
-                continue
-            }
-        }
-        
-        log.Printf("Retry %d: Failed to write to file %s: %v", i+1, filename, err)
-        time.Sleep(retryInterval)
-    }
-    return fmt.Errorf("failed to write after %d attempts: %v", maxRetries, err)
-}
-
-// Update appendToJSONFile function
-func tryAppendToFile(event *RowEvent, filename string) error {
-    seq, err := getNextSeq(filename)
-    if err != nil {
-        return fmt.Errorf("failed to get sequence number: %v", err)
-    }
-    event.Seq = seq  // Update this line to use event.Seq instead of event.Tx.Seq
-
-    var file *os.File
-    if _, err := os.Stat(filename); os.IsNotExist(err) {
-        file, err = os.Create(filename)
-        if err != nil {
-            return fmt.Errorf("failed to create file: %v", err)
-        }
-        if _, err := file.WriteString("[\n"); err != nil {
-            file.Close()
-            return err
-        }
-    } else {
-        file, err = os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
-        if err != nil {
-            return fmt.Errorf("failed to open file: %v", err)
-        }
-        if _, err := file.WriteString(",\n"); err != nil {
-            file.Close()
-            return err
-        }
-    }
-    defer file.Close()
-
-    data, err := json.MarshalIndent(event, "  ", "  ")
-    if err != nil {
-        return fmt.Errorf("failed to marshal JSON: %v", err)
-    }
-
-    if _, err := file.Write(data); err != nil {
-        return fmt.Errorf("failed to write event: %v", err)
-    }
-
-    return nil
-}
-
 // Updated printUpdate function
 func printUpdate(db, table string, ti *schemaInfo, before, after []interface{}) {
-    // Generate row identifier
-    rowID := generateRowIdentifier(ti, after)
-    
-    // Collect changes
-    var changes []ColumnChange
-    if ti != nil {
-        for i, col := range ti.Columns {
-            if !valueEqual(before[i], after[i]) {
-                changes = append(changes, ColumnChange{
-                    Column: col,
-                    From:   sanitize(before[i]),
-                    To:     sanitize(after[i]),
-                })
-            }
-        }
-    }
+	// Generate row identifier
+	rowID := generateRowIdentifier(ti, after)
 
-    // Create the event
-    event := &RowEvent{
-        Op:        "update",
-        Timestamp: toIST(time.Now().UTC().Format(time.RFC3339)),
-        DB:        db,
-        Table:     table,
-        RowKey:    rowID.Value,
-        Changes:   changes,
-    }
+	// Collect changes
+	var changes []ColumnChange
+	if ti != nil {
+		for i, col := range ti.Columns {
+			if !valueEqual(before[i], after[i]) {
+				changes = append(changes, ColumnChange{
+					Column: col,
+					From:   sanitize(before[i]),
+					To:     sanitize(after[i]),
+				})
+			}
+		}
+	}
 
-    // Marshal the event
-    data, err := json.Marshal(event)
-    if err != nil {
-        log.Printf("error marshaling JSON: %v", err)
-        return
-    }
+	// Create the event
+	event := &RowEvent{
+		Op:        "update",
+		Timestamp: toIST(time.Now().UTC().Format(time.RFC3339)),
+		DB:        db,
+		Table:     table,
+		RowKey:    rowID.Value,
+		Changes:   changes,
+	}
 
-    // Publish to Redis
-    // id, err := publisher.PublishJSON(data, fmt.Sprintf("%s.%s:update:%v", db, table, event.RowKey))
-    err = publisher.PublishJSON(data, fmt.Sprintf("%s.%s:update:%v", db, table, event.RowKey))
-    if err != nil {
-        log.Printf("error publishing to Redis: %v", err)
-        return
-    }
-    // log.Printf("Published update event as %s", id)
+	// Marshal the event
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("error marshaling JSON: %v", err)
+		return
+	}
+
+	// Publish to Redis
+	// id, err := publisher.PublishJSON(data, fmt.Sprintf("%s.%s:update:%v", db, table, event.RowKey))
+	err = publisher.PublishJSON(data, fmt.Sprintf("%s.%s:update:%v", db, table, event.RowKey))
+	if err != nil {
+		log.Printf("error publishing to Redis: %v", err)
+		return
+	}
+	// log.Printf("Published update event as %s", id)
 }
 
 // Updated printInsert function
 func printInsert(db, table string, ti *schemaInfo, row []interface{}) {
-    pkVal := pkValue(ti, row)
-    if pkVal == nil {
-        log.Printf("warning: no primary key found for %s.%s", db, table)
-        return
-    }
+	pkVal := pkValue(ti, row)
+	if pkVal == nil {
+		log.Printf("warning: no primary key found for %s.%s", db, table)
+		return
+	}
 
-    event := &RowEvent{
-        Op:        "create",
-        Timestamp: toIST(time.Now().UTC().Format(time.RFC3339)),
-        DB:        db,
-        Table:     table,
-        RowKey:    pkVal,
-        After:     rowAsNamedMap(ti, row),
-    }
+	event := &RowEvent{
+		Op:        "create",
+		Timestamp: toIST(time.Now().UTC().Format(time.RFC3339)),
+		DB:        db,
+		Table:     table,
+		RowKey:    pkVal,
+		After:     rowAsNamedMap(ti, row),
+	}
 
-    // Marshal the event
-    data, err := json.Marshal(event)
-    if err != nil {
-        log.Printf("error marshaling JSON: %v", err)
-        return
-    }
+	// Marshal the event
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("error marshaling JSON: %v", err)
+		return
+	}
 
-    // Publish to Redis
-    // id, err := publisher.PublishJSON(data, fmt.Sprintf("%s.%s:insert:%v", db, table, event.RowKey))
-    err = publisher.PublishJSON(data, fmt.Sprintf("%s.%s:insert:%v", db, table, event.RowKey))
-    if err != nil {
-        log.Printf("error publishing to Redis: %v", err)
-        return
-    }
-    // log.Printf("Published insert event as %s", id)
+	// Publish to Redis
+	// id, err := publisher.PublishJSON(data, fmt.Sprintf("%s.%s:insert:%v", db, table, event.RowKey))
+	err = publisher.PublishJSON(data, fmt.Sprintf("%s.%s:insert:%v", db, table, event.RowKey))
+	if err != nil {
+		log.Printf("error publishing to Redis: %v", err)
+		return
+	}
+	// log.Printf("Published insert event as %s", id)
 }
 
 // Updated printDelete function
 func printDelete(db, table string, ti *schemaInfo, row []interface{}) {
-    pkVal := pkValue(ti, row)
-    if pkVal == nil {
-        log.Printf("warning: no primary key found for %s.%s", db, table)
-        return
-    }
+	pkVal := pkValue(ti, row)
+	if pkVal == nil {
+		log.Printf("warning: no primary key found for %s.%s", db, table)
+		return
+	}
 
-    event := &RowEvent{
-        Op:        "delete",
-        Timestamp: toIST(time.Now().UTC().Format(time.RFC3339)),
-        DB:        db,
-        Table:     table,
-        RowKey:    pkVal,
-        Before:    rowAsNamedMap(ti, row),
-        Tombstone: true,
-    }
+	event := &RowEvent{
+		Op:        "delete",
+		Timestamp: toIST(time.Now().UTC().Format(time.RFC3339)),
+		DB:        db,
+		Table:     table,
+		RowKey:    pkVal,
+		Before:    rowAsNamedMap(ti, row),
+		Tombstone: true,
+	}
 
-    // Marshal the event
-    data, err := json.Marshal(event)
-    if err != nil {
-        log.Printf("error marshaling JSON: %v", err)
-        return
-    }
+	// Marshal the event
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("error marshaling JSON: %v", err)
+		return
+	}
 
-    // Publish to Redis
-    // id, err := publisher.PublishJSON(data, fmt.Sprintf("%s.%s:delete:%v", db, table, event.RowKey))
-    err = publisher.PublishJSON(data, fmt.Sprintf("%s.%s:delete:%v", db, table, event.RowKey))
-    if err != nil {
-        log.Printf("error publishing to Redis: %v", err)
-        return
-    }
-    // log.Printf("Published delete event as %s", id)
+	// Publish to Redis
+	// id, err := publisher.PublishJSON(data, fmt.Sprintf("%s.%s:delete:%v", db, table, event.RowKey))
+	err = publisher.PublishJSON(data, fmt.Sprintf("%s.%s:delete:%v", db, table, event.RowKey))
+	if err != nil {
+		log.Printf("error publishing to Redis: %v", err)
+		return
+	}
+	// log.Printf("Published delete event as %s", id)
 }
 
 func rowAsNamedMap(ti *schemaInfo, row []interface{}) map[string]interface{} {
@@ -632,131 +660,44 @@ func valueEqual(a, b interface{}) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-func emit(doc map[string]interface{}) {
-	j, err := json.Marshal(doc)
-	if err != nil {
-		log.Printf("json error: %v", err)
-		return
-	}
-	fmt.Println(string(j))
-}
-
 // Generate a unique identifier for a row
 func generateRowIdentifier(ti *schemaInfo, row []interface{}) RowIdentifier {
-    // Try primary key first
-    if ti != nil && len(ti.PKCols) > 0 && len(ti.Columns) == len(row) {
-        pkVal := pkValue(ti, row)
-        if pkVal != nil {
-            return RowIdentifier{
-                Value:    fmt.Sprintf("%v", pkVal),
-                Strategy: PrimaryKey,
-                Columns:  ti.PKCols,
-            }
-        }
-    }
+	// Try primary key first
+	if ti != nil && len(ti.PKCols) > 0 && len(ti.Columns) == len(row) {
+		pkVal := pkValue(ti, row)
+		if pkVal != nil {
+			return RowIdentifier{
+				Value:    fmt.Sprintf("%v", pkVal),
+				Strategy: PrimaryKey,
+				Columns:  ti.PKCols,
+			}
+		}
+	}
 
-    // Fall back to hash of all values
-    values := make([]string, 0, len(row))
-    columns := make([]string, 0, len(row))
-    
-    if ti != nil && len(ti.Columns) == len(row) {
-        for i, col := range ti.Columns {
-            values = append(values, fmt.Sprintf("%v", sanitize(row[i])))
-            columns = append(columns, col)
-        }
-    } else {
-        for i, v := range row {
-            values = append(values, fmt.Sprintf("%v", sanitize(v)))
-            columns = append(columns, fmt.Sprintf("col_%d", i+1))
-        }
-    }
+	// Fall back to hash of all values
+	values := make([]string, 0, len(row))
+	columns := make([]string, 0, len(row))
 
-    // Create hash of concatenated values
-    h := sha256.New()
-    h.Write([]byte(strings.Join(values, "|")))
-    hash := fmt.Sprintf("%x", h.Sum(nil)[:8]) // Use first 8 bytes for readability
+	if ti != nil && len(ti.Columns) == len(row) {
+		for i, col := range ti.Columns {
+			values = append(values, fmt.Sprintf("%v", sanitize(row[i])))
+			columns = append(columns, col)
+		}
+	} else {
+		for i, v := range row {
+			values = append(values, fmt.Sprintf("%v", sanitize(v)))
+			columns = append(columns, fmt.Sprintf("col_%d", i+1))
+		}
+	}
 
-    return RowIdentifier{
-        Value:    hash,
-        Strategy: CompositeHash,
-        Columns:  columns,
-    }
+	// Create hash of concatenated values
+	h := sha256.New()
+	h.Write([]byte(strings.Join(values, "|")))
+	hash := fmt.Sprintf("%x", h.Sum(nil)[:8]) // Use first 8 bytes for readability
+
+	return RowIdentifier{
+		Value:    hash,
+		Strategy: CompositeHash,
+		Columns:  columns,
+	}
 }
-
-// Log change tracking information
-func logChangeTracking(tracking ChangeTracking) {
-    var idType string
-    if tracking.HasPrimaryKey {
-        idType = fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(tracking.PrimaryKeys, ", "))
-    } else {
-        idType = fmt.Sprintf("COMPOSITE HASH of (%s)", strings.Join(tracking.RowID.Columns, ", "))
-    }
-
-    // Create changed columns string
-    var changedColsStr string
-    if tracking.ChangedColumns != nil && len(tracking.ChangedColumns) > 0 {
-        changedColsStr = fmt.Sprintf("Changed Cols: %s", strings.Join(tracking.ChangedColumns, ", "))
-    }
-
-    log.Printf(`
-Table Change Details:
--------------------
-Table:        %s
-ID Type:      %s
-Row ID:       %s
-Operation:    %s
-%s`,
-        tracking.TableName,
-        idType,
-        tracking.RowID.Value,
-        tracking.ChangeType,
-        changedColsStr)
-}
-
-// Add reconnection logic
-func connectDB(maxRetries int, retryInterval time.Duration) (*sql.DB, error) {
-    var db *sql.DB
-    var err error
-    
-    for i := 0; i < maxRetries; i++ {
-        db, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", 
-            os.Getenv("DB_USER"), 
-            os.Getenv("DB_PASS"), 
-            os.Getenv("DB_HOST"), 
-            os.Getenv("DB_PORT"), 
-            os.Getenv("DB_NAME")))
-            
-        if err == nil {
-            if err = db.Ping(); err == nil {
-                return db, nil
-            }
-        }
-        
-        log.Printf("Database connection attempt %d failed: %v. Retrying in %v...", 
-            i+1, err, retryInterval)
-        time.Sleep(retryInterval)
-    }
-    return nil, fmt.Errorf("failed to connect after %d attempts: %v", maxRetries, err)
-}
-
-// Add periodic cleanup of tableMap cache
-func cleanupTableMapCache(tableMap *sync.Map) {
-    ticker := time.NewTicker(1 * time.Hour)
-    go func() {
-        for range ticker.C {
-            var keysToDelete []uint64
-            tableMap.Range(func(k, v interface{}) bool {
-                // Add logic to determine old entries
-                keysToDelete = append(keysToDelete, k.(uint64))
-                return true
-            })
-            for _, k := range keysToDelete {
-                tableMap.Delete(k)
-            }
-            log.Printf("Cleaned up %d old table map entries", len(keysToDelete))
-        }
-    }()
-}
-
-
-
