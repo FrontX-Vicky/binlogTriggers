@@ -5,63 +5,43 @@ import (
 )
 
 type Filter struct {
-	dbSet     map[string]struct{}
-	tableSet  map[string]struct{}
-	idSet     map[interface{}]struct{}
-	opSet     map[string]struct{}
-	changeAny map[string]struct{}
-	changeAll map[string]struct{}
+	dbSet     strset
+	tableSet  strset
+	idSet     strset
+	opSet     strset
+	changeAny strset
+	changeAll strset
 }
 
 func NewFilter(cfg *Config) *Filter {
 	return &Filter{
-		dbSet:     toSet(cfg.FilterDBs),
-		tableSet:  toSet(cfg.FilterTables),
-		idSet:     toInterfaceSet(cfg.FilterIDs),
-		opSet:     toSet(cfg.FilterOps),
-		changeAny: toSet(cfg.FilterChangeAny),
-		changeAll: toSet(cfg.FilterChangeAll),
+		dbSet:     toSet(cfg.FilterDBs, false),
+		tableSet:  toSet(cfg.FilterTables, false),
+		idSet:     toSet(cfg.FilterIDs, false),
+		opSet:     toSet(cfg.FilterOps, true),
+		changeAny: toSet(cfg.FilterChangeAny, false),
+		changeAll: toSet(cfg.FilterChangeAll, false),
 	}
 }
 
 func (f *Filter) Matches(ev *event.RowEvent) bool {
-	if len(f.dbSet) > 0 && !inSet(ev.DB, f.dbSet) {
+	if !inSet(f.dbSet, ev.DB) {
 		return false
 	}
-	if len(f.tableSet) > 0 && !inSet(ev.Table, f.tableSet) {
+	if !inSet(f.tableSet, ev.Table) {
 		return false
 	}
-	if len(f.idSet) > 0 {
-		k := rowKeyToInterface(ev.RowKey)
-		if !inInterfaceSet(k, f.idSet) {
-			return false
-		}
-	}
-	if len(f.opSet) > 0 && !inSet(ev.Op, f.opSet) {
+	if !inSet(f.idSet, rowKeyToString(ev.RowKey)) {
 		return false
 	}
-	if len(f.changeAny) > 0 && !hasAnyColumns(ev.Changes, f.changeAny) {
+	if !inSet(f.opSet, ev.Op) {
 		return false
 	}
-	if len(f.changeAll) > 0 && !hasAllColumns(ev.Changes, f.changeAll) {
+	if !hasAnyColumns(ev.Changes, f.changeAny) {
+		return false
+	}
+	if !hasAllColumns(ev.Changes, f.changeAll) {
 		return false
 	}
 	return true
-}
-
-func toInterfaceSet(arr []interface{}) map[interface{}]struct{} {
-	m := make(map[interface{}]struct{}, len(arr))
-	for _, v := range arr {
-		m[v] = struct{}{}
-	}
-	return m
-}
-
-func inInterfaceSet(val interface{}, s map[interface{}]struct{}) bool {
-	_, ok := s[val]
-	return ok
-}
-
-func rowKeyToInterface(k interface{}) interface{} {
-	return k
 }

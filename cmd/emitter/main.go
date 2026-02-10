@@ -303,14 +303,16 @@ func streamChanges(ctx context.Context, cfg *Config) error {
 
 	host, port := splitHostPort(cfg.Addr)
 	syncerCfg := replication.BinlogSyncerConfig{
-		ServerID:   cfg.ServerID,
-		Flavor:     "mysql",
-		Host:       host,
-		Port:       port,
-		User:       cfg.DBUser,
-		Password:   cfg.DBPass,
-		UseDecimal: true,
-		ParseTime:  true,
+		ServerID:        cfg.ServerID,
+		Flavor:          "mysql",
+		Host:            host,
+		Port:            port,
+		User:            cfg.DBUser,
+		Password:        cfg.DBPass,
+		UseDecimal:      true,
+		ParseTime:       true,
+		HeartbeatPeriod: 30 * time.Second,
+		ReadTimeout:     90 * time.Second,
 	}
 
 	syncer := replication.NewBinlogSyncer(syncerCfg)
