@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +21,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+var apiLogger *log.Logger
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -29,6 +32,11 @@ func main() {
 	apiURL := os.Getenv("API_URL")
 	if strings.TrimSpace(apiURL) == "" {
 		log.Fatalf("API_URL is required")
+	}
+
+	// Setup API log file
+	if err := setupAPILogger(); err != nil {
+		log.Fatalf("setup api logger: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -48,6 +56,23 @@ func main() {
 		cancel()
 	case <-ctx.Done():
 	}
+}
+
+func setupAPILogger() error {
+	logDir := filepath.Join("cmd", "subscribers", "lead_events")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return err
+	}
+
+	logFile := filepath.Join(logDir, "api_calls.log")
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+
+	apiLogger = log.New(io.MultiWriter(os.Stdout, f), "[API] ", log.LstdFlags)
+	log.Printf("API call logs will be written to: %s", logFile)
+	return nil
 }
 
 func loadConfig() (*subscriber.Config, error) {
@@ -116,6 +141,7 @@ func handleEvent(raw string, filter *subscriber.Filter, apiURL string, logPrefix
 
 	// Call API
 	if err := callAPI(apiURL, &ev); err != nil {
+		apiLogger.Printf("FAILED | URL=%s | Error=%v | Event: op=%s table=%s key=%v", apiURL, err, ev.Op, ev.Table, ev.RowKey)
 		return fmt.Errorf("api call: %w", err)
 	}
 
@@ -135,17 +161,26 @@ func callAPI(url string, ev *event.RowEvent) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	startTime := time.Now()
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
+	duration := time.Since(startTime)
+
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
+		apiLogger.Printf("ERROR | Status=%d | Duration=%v | URL=%s | Response=%s | Payload=%s",
+			resp.StatusCode, duration, url, string(body), string(payload))
 		return fmt.Errorf("api returned %d: %s", resp.StatusCode, string(body))
 	}
+
+	apiLogger.Printf("SUCCESS | Status=%d | Duration=%v | URL=%s | Response=%s | Event: op=%s table=%s key=%v",
+		resp.StatusCode, duration, url, string(body), ev.Op, ev.Table, ev.RowKey)
 
 	return nil
 }
