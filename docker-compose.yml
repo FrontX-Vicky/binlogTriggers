@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  # CDC Emitter Service
+  # Connects to MySQL and Redis on host machine
+  emitter:
+    build:
+      context: .
+      dockerfile: Dockerfile.emitter
+    env_file:
+      - .env
+    network_mode: host
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # CDC Subscribers Service
+  # Connects to Redis on host machine
+  subscribers:
+    build:
+      context: .
+      dockerfile: Dockerfile.subscribers
+    environment:
+      - ENV_FILES=./.env.lead_events,./.env.user_events
+    volumes:
+      - ./:/app:ro
+    network_mode: host
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
