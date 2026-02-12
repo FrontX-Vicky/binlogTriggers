@@ -1,36 +1,30 @@
 [Unit]
 Description=CDC Binlog Emitter Service
 Documentation=https://github.com/FrontX-Vicky/binlogTriggers
-After=network.target mysql.service redis.service
-Wants=mysql.service redis.service
+After=network.target mysql.service redis-server.service
+Wants=mysql.service redis-server.service
 
 [Service]
 Type=simple
-User=cdc
-Group=cdc
-WorkingDirectory=/opt/cdc-platform
-EnvironmentFile=/opt/cdc-platform/.env
-ExecStart=/opt/cdc-platform/bin/emitter
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/go-workspace/mysql_changelog_publisher
+ExecStart=/var/www/go-workspace/mysql_changelog_publisher/cdc-emitter
 Restart=always
-RestartSec=10
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cdc-emitter
 
-# Security settings
+# Environment
+Environment="PATH=/usr/local/go/bin:/usr/bin:/bin"
+
+# Security
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/cdc-platform/logs
 
-# Resource limits
-LimitNOFILE=65535
-LimitNPROC=4096
-
-# Health monitoring
-TimeoutStartSec=30
-TimeoutStopSec=30
+# Resource Limits
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
