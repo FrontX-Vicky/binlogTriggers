@@ -1,6 +1,11 @@
-# CDC Platform Installation Guide - Fresh Server Setup
+# CDC Platform Installation Guide - Ubuntu 22.04 LTS (VM)
 
-Complete step-by-step installation for a new server.
+Complete step-by-step installation for Ubuntu 22.04.3 LTS (Jammy) on VM.
+
+**Target System:**
+- OS: Ubuntu 22.04.3 LTS (Jammy Jellyfish)
+- Environment: Virtual Machine
+- Architecture: x86_64
 
 ---
 
@@ -8,188 +13,156 @@ Complete step-by-step installation for a new server.
 1. [Prerequisites Installation](#prerequisites-installation)
 2. [MySQL Setup & Configuration](#mysql-setup--configuration)
 3. [Redis Setup](#redis-setup)
-4. [Docker Installation](#docker-installation)
-5. [Project Setup](#project-setup)
-6. [Configuration](#configuration)
-7. [Pre-Flight Checks](#pre-flight-checks)
-8. [Running the Services](#running-the-services)
-9. [Verification Tests](#verification-tests)
-10. [Troubleshooting](#troubleshooting)
+4. [Project Setup](#project-setup)
+5. [Configuration](#configuration)
+6. [Build Binaries](#build-binaries)
+7. [Systemd Service Setup](#systemd-service-setup)
+8. [Verification Tests](#verification-tests)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Prerequisites Installation
 
-### For Linux (Ubuntu/Debian)
+### System Update & Basic Tools
 
 ```bash
 # Update system packages
 sudo apt update && sudo apt upgrade -y
 
-# Install basic tools
-sudo apt install -y curl wget git build-essential
+# Install basic development tools
+sudo apt install -y curl wget git build-essential vim net-tools
 
-# Install Go (required for building binaries)
-wget https://go.dev/dl/go1.21.6.linux-amd64.tar.gz
+# Install Go 1.23.1 (required for building)
+cd /tmp
+wget https://go.dev/dl/go1.23.1.linux-amd64.tar.gz
 sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go1.21.6.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.23.1.linux-amd64.tar.gz
+
+# Add Go to PATH
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+echo 'export GOPATH=$HOME/go' >> ~/.bashrc
+echo 'export PATH=$PATH:$GOPATH/bin' >> ~/.bashrc
 source ~/.bashrc
 
 # Verify Go installation
 go version
-```
-
-### For Windows Server
-
-```powershell
-# Install Chocolatey (package manager)
-Set-ExecutionPolicy Bypass -Scope Process -Force
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-
-# Install Git
-choco install git -y
-
-# Install Go
-choco install golang -y
-
-# Refresh environment
-refreshenv
-
-# Verify Go installation
-go version
+# Should output: go version go1.23.1 linux/amd64
 ```
 
 ---
 
 ## MySQL Setup & Configuration
 
-### Install MySQL
+### Install MySQL 8.0 on Ubuntu 22.04
 
-**Ubuntu/Debian:**
 ```bash
+# Install MySQL Server
 sudo apt install -y mysql-server mysql-client
 
-# Secure MySQL installation
+# Start MySQL service
+sudo systemctl start mysql
+sudo systemctl enable mysql
+
+# Check MySQL status
+sudo systemctl status mysql
+
+# Secure MySQL installation (set root password, remove test DB, etc.)
 sudo mysql_secure_installation
 ```
 
-**Windows Server:**
-```powershell
-# Download MySQL from https://dev.mysql.com/downloads/installer/
-# Or use Chocolatey
-choco install mysql -y
+### Create CDC User
+
+```bash
+# Login to MySQL as root
+sudo mysql -u root -p
+
+# Create dedicated user for CDC
+CREATE USER 'cdc_user'@'localhost' IDENTIFIED BY 'your_secure_password';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'cdc_user'@'localhost';
+FLUSH PRIVILEGES;
+EXIT;
 ```
 
-### Configure MySQL for Binlog
+### Configure MySQL for Binlog Replication
 
-**Linux:** Edit `/etc/mysql/mysql.conf.d/mysqld.cnf` or `/etc/my.cnf`
+```bash
+# Edit MySQL configuration
+sudo vim /etc/mysql/mysql.conf.d/mysqld.cnf
 
-**Windows:** Edit `C:\ProgramData\MySQL\MySQL Server 8.0\my.ini`
+# Add these settings under [mysqld] section:
+```
 
-Add these settings under `[mysqld]` section:
+Add to `/etc/mysql/mysql.conf.d/mysqld.cnf`:
 
 ```ini
 [mysqld]
-# Server identification
+# Server identification (must be unique if multiple MySQL instances)
 server-id=1
 
-# Binary logging
-log-bin=mysql-bin
+# Binary logging configuration
+log-bin=/var/log/mysql/mysql-bin
 binlog-format=ROW
 binlog-row-image=FULL
 
-# GTID mode (recommended)
-gtid-mode=ON
-enforce-gtid-consistency=ON
-
 # Binary log retention (7 days)
 binlog_expire_logs_seconds=604800
+
+# Max binlog size (1GB)
+max_binlog_size=1073741824
 ```
 
-### Restart MySQL
+**Restart MySQL:**
 
-**Linux:**
 ```bash
 sudo systemctl restart mysql
 sudo systemctl status mysql
-```
 
-**Windows (PowerShell as Admin):**
-```powershell
-Restart-Service MySQL80
-Get-Service MySQL80
-```
+# Verify binlog is enabled
+sudo mysql -u root -p -e "SHOW VARIABLES LIKE 'log_bin';"
+sudo mysql -u root -p -e "SHOW VARIABLES LIKE 'binlog_format';"
+sudo mysql -u root -p -e "SHOW VARIABLES LIKE 'server_id';"
 
-### Create Database User
-
-```bash
-# Connect to MySQL
-mysql -u root -p
-
-# Or on Windows
-mysql -u root -p
-```
-
-```sql
--- Create database
-CREATE DATABASE IF NOT EXISTS your_database;
-
--- Create CDC user with replication privileges
-CREATE USER 'cdcuser'@'%' IDENTIFIED BY 'strong_password_here';
-GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdcuser'@'%';
-GRANT SELECT ON your_database.* TO 'cdcuser'@'%';
-FLUSH PRIVILEGES;
-
--- Verify binlog is enabled
-SHOW VARIABLES LIKE 'log_bin';
-SHOW VARIABLES LIKE 'binlog_format';
-SHOW VARIABLES LIKE 'server_id';
-
--- Check binary logs
-SHOW BINARY LOGS;
-
--- Exit
-EXIT;
+# Check binary logs
+sudo mysql -u root -p -e "SHOW BINARY LOGS;"
 ```
 
 ### Test MySQL Connection
 
 ```bash
-# Test connection
-mysql -h 127.0.0.1 -u cdcuser -p -e "SHOW DATABASES;"
+# Test CDC user connection
+mysql -h localhost -u cdc_user -p -e "SHOW DATABASES;"
+
+# Verify replication privileges
+mysql -h localhost -u cdc_user -p -e "SHOW GRANTS;"
 ```
 
 ---
 
 ## Redis Setup
 
-### Install Redis
+### Install Redis on Ubuntu 22.04
 
-**Ubuntu/Debian:**
 ```bash
+# Install Redis
 sudo apt install -y redis-server
 
-# Configure Redis (optional)
-sudo nano /etc/redis/redis.conf
-# Set: bind 127.0.0.1
-# Set: protected-mode yes
+# Configure Redis for production
+sudo vim /etc/redis/redis.conf
+
+# Recommended settings:
+# supervised systemd
+# bind 127.0.0.1 ::1
+# protected-mode yes
+# maxmemory 256mb
+# maxmemory-policy allkeys-lru
 
 # Restart Redis
-sudo systemctl restart redis
-sudo systemctl enable redis
-sudo systemctl status redis
-```
+sudo systemctl restart redis-server
+sudo systemctl enable redis-server
 
-**Windows Server:**
-```powershell
-# Download from https://github.com/microsoftarchive/redis/releases
-# Or use Chocolatey
-choco install redis-64 -y
-
-# Start Redis service
-redis-server --service-start
+# Check Redis status
+sudo systemctl status redis-server
 ```
 
 ### Test Redis Connection
@@ -526,105 +499,292 @@ make run-subscribers
 make run-console
 ```
 
----
-
-## Verification Tests
-
-### Test 1: Check Services Are Running
-
-**Docker:**
 ```bash
-docker-compose ps
-# Both services should be "Up"
+# Test with inquiry_cron table (lead_events subscriber)
+mysql -h localhost -u cdc_user -p your_database_name
+
+# Insert test data
+INSERT INTO inquiry_cron (column1, column2) VALUES ('test', 'data');
+
+# Check subscriber logs
+sudo journalctl -u cdc-subscribers -n 20
+
+# Check API call logs
+tail -f /var/www/go-workspace/mysql_changelog_publisher/logs/lead_events/api_calls.log
 ```
 
-**Systemd:**
-```bash
-sudo systemctl status cdc-emitter cdc-subscribers
-# Both should be "active (running)"
-```
-
-### Test 2: Check Logs
-
-**Docker:**
-```bash
-# Check emitter connected to MySQL
-docker-compose logs emitter | grep -i "connected\|mysql"
-
-# Check emitter connected to Redis
-docker-compose logs emitter | grep -i "redis"
-
-# Check subscribers connected
-docker-compose logs subscribers | grep -i "connected\|subscribed"
-```
-
-**Systemd:**
-```bash
-sudo journalctl -u cdc-emitter -n 50 | grep -i "connected"
-sudo journalctl -u cdc-subscribers -n 50 | grep -i "subscribed"
-```
-
-### Test 3: Create Test Data in MySQL
-
-```bash
-mysql -h 127.0.0.1 -u root -p
-```
-
-```sql
-USE your_database;
-
--- Create test table if doesn't exist
-CREATE TABLE IF NOT EXISTS test_table (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    name VARCHAR(100),
-    email VARCHAR(100),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Insert test record
-INSERT INTO test_table (name, email) VALUES ('Test User', 'test@example.com');
-
--- Update test record
-UPDATE test_table SET name = 'Updated User' WHERE id = 1;
-
--- Check the record
-SELECT * FROM test_table;
-```
-
-### Test 4: Verify Events Are Being Captured
-
-**Docker:**
-```bash
-# Check emitter logs for published events
-docker-compose logs emitter | tail -20
-
-# Should see lines like:
-# Published event to binlog:all
-# RowEvent{Op:insert, Schema:your_database, Table:test_table}
-```
-
-**Console subscriber test:**
-```bash
-# Run console subscriber to see events in real-time
-make run-console
-
-# In another terminal, insert/update MySQL data
-# You should see events printed to console
-```
-
-### Test 5: Redis Pub/Sub Verification
+### Redis Pub/Sub Verification
 
 ```bash
 # Terminal 1 - Subscribe to channel
 redis-cli SUBSCRIBE binlog:all
 
-# Terminal 2 - Perform MySQL operation
-mysql -h 127.0.0.1 -u root -p -e "INSERT INTO your_database.test_table (name, email) VALUES ('Redis Test', 'redis@test.com');"
+# Terminal 2 - Insert MySQL data
+mysql -h localhost -u cdc_user -p -e "INSERT INTO your_database.test_table (name) VALUES ('Redis Test');"
 
-# Terminal 1 should show the message published by emitter
+# Terminal 1 should show the published event
 ```
 
-### Test 6: End-to-End Test
+### Monitor System Resources
+
+```bash
+# Check CPU/Memory usage
+htop
+
+# Or
+top -c | grep cdc
+
+# Check disk usage
+df -h
+
+# Check network connections
+sudo netstat -tlnp | grep -E '3306|6379'
+```
+
+---
+
+## Troubleshooting
+
+### Emitter Won't Start
+
+```bash
+# Check MySQL connection
+mysql -h localhost -u cdc_user -p -e "SHOW DATABASES;"
+
+# Check binlog enabled
+mysql -h localhost -u cdc_user -p -e "SHOW VARIABLES LIKE 'log_bin';"
+
+# Check permissions
+mysql -h localhost -u cdc_user -p -e "SHOW GRANTS;"
+
+# View emitter logs
+sudo journalctl -u cdc-emitter -n 100 --no-pager
+
+# Check .env file
+cat /var/www/go-workspace/mysql_changelog_publisher/.env
+```
+
+### Subscribers Not Receiving Events
+
+```bash
+# Check Redis connection
+redis-cli PING
+
+# Check if emitter is publishing
+redis-cli SUBSCRIBE binlog:all
+# (wait for events)
+
+# Check subscriber logs
+sudo journalctl -u cdc-subscribers -n 100 --no-pager
+
+# Test manual subscription
+redis-cli PSUBSCRIBE 'binlog:*'
+```
+
+### High CPU Usage
+
+```bash
+# Check binlog size
+sudo ls -lh /var/log/mysql/mysql-bin.*
+
+# Check event rate
+sudo journalctl -u cdc-emitter --since "1 minute ago" | wc -l
+
+# Adjust binlog retention
+sudo mysql -u root -p -e "SET GLOBAL binlog_expire_logs_seconds = 259200;" # 3 days
+```
+
+### Service Crashes/Restarts
+
+```bash
+# View crash logs
+sudo journalctl -u cdc-emitter --since "1 hour ago" | grep -i "error\|fail\|exit"
+sudo journalctl -u cdc-subscribers --since "1 hour ago" | grep -i "error\|fail\|exit"
+
+# Check for "invalid sequence" errors (MySQL packet corruption)
+sudo journalctl -u cdc-emitter | grep "invalid sequence"
+
+# If frequent crashes, check:
+# 1. Network stability to MySQL
+# 2. MySQL max_connections setting
+# 3. SERVER_ID conflicts (must be unique)
+```
+
+### API Calls Not Working
+
+```bash
+# Check API URL in .env.lead_events
+cat .env.lead_events
+
+# Test API manually
+curl -X POST https://your-api-endpoint.com/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"test":"data"}'
+
+# Check API logs
+tail -f logs/lead_events/api_calls.log
+
+# Check debounce setting
+grep DEBOUNCE .env.lead_events
+```
+
+### Permission Issues
+
+```bash
+# Fix ownership
+sudo chown -R www-data:www-data /var/www/go-workspace/mysql_changelog_publisher
+
+# Fix binary permissions
+chmod +x /var/www/go-workspace/mysql_changelog_publisher/cdc-*
+
+# Fix log directory
+mkdir -p /var/www/go-workspace/mysql_changelog_publisher/logs
+sudo chown -R www-data:www-data /var/www/go-workspace/mysql_changelog_publisher/logs
+```
+
+### Service Management Commands
+
+```bash
+# Stop services
+sudo systemctl stop cdc-emitter cdc-subscribers
+
+# Restart services
+sudo systemctl restart cdc-emitter cdc-subscribers
+
+# View full service config
+systemctl cat cdc-emitter
+systemctl cat cdc-subscribers
+
+# Reload systemd after config changes
+sudo systemctl daemon-reload
+
+# Disable services (prevent auto-start)
+sudo systemctl disable cdc-emitter cdc-subscribers
+```
+
+---
+
+## Maintenance
+
+### Update Binaries
+
+```bash
+cd /var/www/go-workspace/mysql_changelog_publisher
+
+# Pull latest code
+git pull origin main
+
+# Rebuild
+go build -o cdc-emitter ./cmd/emitter
+go build -o cdc-subscribers ./cmd/subscribers
+
+# Restart services
+sudo systemctl restart cdc-emitter cdc-subscribers
+```
+
+### Backup Configuration
+
+```bash
+# Backup env files
+cp .env .env.backup
+cp .env.lead_events .env.lead_events.backup
+
+# Backup logs (optional)
+tar -czf logs-backup-$(date +%Y%m%d).tar.gz logs/
+```
+
+### Monitor Logs
+
+```bash
+# Real-time monitoring
+sudo journalctl -u cdc-emitter -u cdc-subscribers -f
+
+# Export logs
+sudo journalctl -u cdc-emitter --since "24 hours ago" > emitter-last24h.log
+```
+
+---
+
+## Performance Tuning
+
+### MySQL Optimization
+
+```sql
+-- Check binlog cache size
+SHOW VARIABLES LIKE 'binlog_cache_size';
+
+-- Increase if needed (in my.cnf)
+-- binlog_cache_size = 1M
+
+-- Check connection limits
+SHOW VARIABLES LIKE 'max_connections';
+```
+
+### Redis Optimization
+
+```bash
+# Edit /etc/redis/redis.conf
+sudo vim /etc/redis/redis.conf
+
+# Recommended settings for CDC:
+# maxmemory 512mb
+# maxmemory-policy allkeys-lru
+# save ""  # Disable persistence if not needed
+
+sudo systemctl restart redis-server
+```
+
+---
+
+## Quick Reference
+
+### Service Commands
+```bash
+# Start
+sudo systemctl start cdc-emitter cdc-subscribers
+
+# Stop
+sudo systemctl stop cdc-emitter cdc-subscribers
+
+# Restart
+sudo systemctl restart cdc-emitter cdc-subscribers
+
+# Status
+sudo systemctl status cdc-emitter cdc-subscribers
+
+# Logs
+sudo journalctl -u cdc-emitter -f
+sudo journalctl -u cdc-subscribers -f
+```
+
+### Build Commands
+```bash
+# Build both
+go build -o cdc-emitter ./cmd/emitter && go build -o cdc-subscribers ./cmd/subscribers
+
+# Build emitter only
+go build -o cdc-emitter ./cmd/emitter
+
+# Build subscribers only
+go build -o cdc-subscribers ./cmd/subscribers
+```
+
+### Configuration Files
+- `/var/www/go-workspace/mysql_changelog_publisher/.env` - Emitter config
+- `/var/www/go-workspace/mysql_changelog_publisher/.env.lead_events` - Lead events subscriber
+- `/var/www/go-workspace/mysql_changelog_publisher/.env.user_events` - User events subscriber
+- `/etc/systemd/system/cdc-emitter.service` - Emitter service
+- `/etc/systemd/system/cdc-subscribers.service` - Subscribers service
+
+---
+
+## Support
+
+For issues or questions:
+1. Check logs: `sudo journalctl -u cdc-emitter -u cdc-subscribers -n 100`
+2. Verify configuration files
+3. Test MySQL/Redis connectivity
+4. Review GitHub issues: https://github.com/FrontX-Vicky/binlogTriggers/issues
 
 ```bash
 # 1. Monitor subscriber logs
