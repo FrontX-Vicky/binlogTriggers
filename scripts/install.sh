@@ -53,13 +53,13 @@ echo ""
 # Step 3: Create logs directory
 echo "📁 Creating logs directory..."
 mkdir -p logs
-sudo chown -R www-data:www-data logs
+sudo chown -R developer:developer logs
 echo "✓ Logs directory created"
 echo ""
 
 # Step 4: Set permissions
 echo "🔒 Setting permissions..."
-sudo chown -R www-data:www-data $CURRENT_DIR
+sudo chown -R developer:developer $CURRENT_DIR
 chmod +x cdc-emitter cdc-subscribers
 echo "✓ Permissions set"
 echo ""
