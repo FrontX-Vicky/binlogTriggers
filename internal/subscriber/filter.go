@@ -5,12 +5,12 @@ import (
 )
 
 type Filter struct {
-	dbSet        strset
-	tableSet     strset
-	idSet        strset
-	opSet        strset
-	changeAny    strset
-	changeAll    strset
+	dbSet           strset
+	tableSet        strset
+	idSet           strset
+	opSet           strset
+	changeAny       strset
+	changeAll       strset
 	excludeDBSet    strset
 	excludeTableSet strset
 }

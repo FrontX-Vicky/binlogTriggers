@@ -52,7 +52,7 @@ func LoadConfigFromLookup(lookup EnvLookup) *Config {
 		FilterOps:       parseCSV(get("FILTER_OPS")),
 		FilterChangeAny: parseCSV(get("FILTER_CHANGE_ANY")),
 		FilterChangeAll: parseCSV(get("FILTER_CHANGE_ALL")),
-		
+
 		// Exclude filters (blacklist)
 		ExcludeDBs:    parseCSV(get("EXCLUDE_DBS")),
 		ExcludeTables: parseCSV(get("EXCLUDE_TABLES")),
