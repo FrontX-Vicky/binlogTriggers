@@ -6,8 +6,8 @@ Wants=redis-server.service
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=developer
+Group=developer
 WorkingDirectory=/var/www/go-workspace/mysql_changelog_publisher
 ExecStart=/var/www/go-workspace/mysql_changelog_publisher/cdc-subscribers
 Restart=always

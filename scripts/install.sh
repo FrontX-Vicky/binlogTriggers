@@ -61,13 +61,13 @@ touch logs/emitter/messages.log 2>/dev/null || true
 touch logs/subscribers/messages.log 2>/dev/null || true
 
 # Set ownership
-sudo chown -R www-data:www-data logs
+sudo chown -R developer:developer logs
 echo "✓ Logs directory created with proper permissions"
 echo ""
 
 # Step 4: Set permissions
 echo "🔒 Setting permissions..."
-sudo chown -R www-data:www-data $CURRENT_DIR
+sudo chown -R developer:developer $CURRENT_DIR
 chmod +x cdc-emitter cdc-subscribers
 echo "✓ Permissions set"
 echo ""
